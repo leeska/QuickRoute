@@ -1,5 +1,7 @@
 import contextlib
 import hashlib
+import importlib.machinery
+import importlib.util
 import io
 import json
 import subprocess
@@ -10,9 +12,12 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-
-import quickroute_lib as qr
+loader = importlib.machinery.SourceFileLoader("quickroute", str(ROOT / "quickroute"))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+assert spec is not None
+qr = importlib.util.module_from_spec(spec)
+sys.modules[loader.name] = qr
+loader.exec_module(qr)
 
 
 def trace(*asns):
@@ -115,10 +120,10 @@ class DownloadTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             qr.verify_digest(data, "sha256:" + "0" * 64)
 
-    @mock.patch("quickroute_lib.platform.machine", return_value="x86_64")
-    @mock.patch("quickroute_lib._download_to_file")
-    @mock.patch("quickroute_lib._json_url")
-    @mock.patch("quickroute_lib.shutil.which", return_value=None)
+    @mock.patch("quickroute.platform.machine", return_value="x86_64")
+    @mock.patch("quickroute._download_to_file")
+    @mock.patch("quickroute._json_url")
+    @mock.patch("quickroute.shutil.which", return_value=None)
     def test_download_to_cache(self, _which, json_url, download_to_file, _machine):
         data = b"binary"
         json_url.return_value = {
@@ -142,7 +147,7 @@ class DownloadTests(unittest.TestCase):
             self.assertEqual(repaired.read_bytes(), data)
             download_to_file.assert_called_once()
 
-    @mock.patch("quickroute_lib.urllib.request.urlopen")
+    @mock.patch("quickroute.urllib.request.urlopen")
     def test_download_rejects_large_content_length(self, urlopen):
         response = mock.MagicMock()
         response.headers = {"Content-Length": str(qr.MAX_DOWNLOAD_BYTES + 1)}
@@ -172,8 +177,8 @@ class CliTests(unittest.TestCase):
             self.assertEqual(result.status, "error")
             self.assertIn("timeout", result.error or "")
 
-    @mock.patch("quickroute_lib.ensure_nexttrace", return_value="nexttrace")
-    @mock.patch("quickroute_lib.trace_one", side_effect=RuntimeError("boom"))
+    @mock.patch("quickroute.ensure_nexttrace", return_value="nexttrace")
+    @mock.patch("quickroute.trace_one", side_effect=RuntimeError("boom"))
     def test_worker_exception_does_not_abort_report(self, _trace, _ensure):
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):

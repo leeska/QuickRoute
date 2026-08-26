@@ -4,10 +4,10 @@
 
 ## 快速使用
 
-固定 `v0.1.1` 并校验两个入口文件后执行：
+一键运行：
 
 ```bash
-d=$(mktemp -d) && base=https://raw.githubusercontent.com/leeska/QuickRoute/v0.1.1 && curl -fsSL "$base/quickroute" -o "$d/quickroute" && curl -fsSL "$base/quickroute_lib.py" -o "$d/quickroute_lib.py" && printf '%s  %s\n%s  %s\n' fc71817cebc49394e4bad9bd6da96efa26a9b207ad0e4dba84282d6ed4705dc4 quickroute 7a47ebb060bd4df03892669135c7f971386b1543f089a88b0f45213932f88ae5 quickroute_lib.py | (cd "$d" && sha256sum -c -) && python3 "$d/quickroute"; rc=$?; rm -rf "$d"; exit $rc
+curl -fsSL https://raw.githubusercontent.com/leeska/QuickRoute/main/quickroute | python3 -
 ```
 
 或克隆运行：
@@ -18,7 +18,7 @@ cd QuickRoute
 ./quickroute
 ```
 
-要求 Python 3.9+。如果系统没有 `nexttrace`，QuickRoute 会从 `nxtrace/NTrace-core` 最新 GitHub Release 下载匹配架构的 `nexttrace-tiny` 到用户缓存目录，并使用 Release API 提供的 SHA256 digest 强制校验。
+`quickroute` 是单文件程序，要求 Python 3.9+。如果系统没有 `nexttrace`，QuickRoute 会从 `nxtrace/NTrace-core` 最新 GitHub Release 下载匹配架构的 `nexttrace-tiny` 到用户缓存目录，并使用 Release API 提供的 SHA256 digest 强制校验。
 
 ## 常用参数
 
