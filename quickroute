@@ -24,14 +24,22 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 SCHEMA_VERSION = "1.0"
 RELEASE_API = "https://api.github.com/repos/nxtrace/NTrace-core/releases/latest"
 MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
 DOWNLOAD_CHUNK_BYTES = 1024 * 1024
-CITY_NAMES = {"bj": "北京", "sh": "上海", "gd": "广东"}
+CITY_NAMES = {
+    "he": "河北", "sx": "山西", "ln": "辽宁", "jl": "吉林", "hl": "黑龙江",
+    "js": "江苏", "zj": "浙江", "ah": "安徽", "fj": "福建", "jx": "江西",
+    "sd": "山东", "ha": "河南", "hb": "湖北", "hn": "湖南", "gd": "广东",
+    "hi": "海南", "sc": "四川", "gz": "贵州", "yn": "云南", "sn": "陕西",
+    "gs": "甘肃", "qh": "青海", "nm": "内蒙古", "gx": "广西", "xz": "西藏",
+    "nx": "宁夏", "xj": "新疆", "bj": "北京", "tj": "天津", "sh": "上海",
+    "cq": "重庆",
+}
 ISP_NAMES = {"ct": "电信", "cu": "联通", "cm": "移动"}
-DEFAULT_CITIES = ("bj", "sh", "gd")
+DEFAULT_CITIES = tuple(CITY_NAMES)
 DEFAULT_ISPS = ("ct", "cu", "cm")
 PARALLEL_MAX = 9
 PARALLEL_WORKER_MIB = 48
@@ -90,6 +98,27 @@ def _valid_ip(value: str) -> Optional[str]:
         return None
 
 
+def infer_asn_from_ip(value: str) -> Optional[int]:
+    """Infer well-known China backbone ASNs when NextTrace omits ASN metadata."""
+    ip = value.lower()
+    prefixes = (
+        (("59.43.",), 4809),
+        (("203.22.178.", "203.22.179.", "203.22.182.", "203.128.224.", "69.194."), 23764),
+        (("202.97.", "202.96.", "219.141.", "219.142.", "106.37.", "240e:"), 4134),
+        (("219.158.", "2408:"), 4837),
+        (("223.120.", "223.119."), 58453),
+        (("221.183.", "111.24.", "111.13.", "2409:8080:"), 9808),
+        (("2402:4f00:f000:",), 58807),
+        (("103.214.", "103.228.68.", "103.239.176.", "118.26.151.", "162.245.124.", "202.77.23.", "203.160.66.", "203.160.75.", "2401:8a00:"), 10099),
+        (("210.14.", "210.51.", "210.78.", "218.105."), 9929),
+        (("159.226.",), 7497),
+    )
+    for candidates, asn in prefixes:
+        if ip.startswith(candidates):
+            return asn
+    return None
+
+
 def parse_nexttrace(text: str) -> list[Hop]:
     """Parse ordinary or raw-ish NextTrace text, preserving ECMP replies per TTL."""
     hops: list[Hop] = []
@@ -116,7 +145,7 @@ def parse_nexttrace(text: str) -> list[Hop]:
         pending = Hop(
             number=number,
             ip=ip,
-            asn=int(asn_match.group(1)) if asn_match else None,
+            asn=int(asn_match.group(1)) if asn_match else (infer_asn_from_ip(ip) if ip else None),
             latency_ms=float(latency_match.group(1)) if latency_match else None,
             raw=original,
         )
@@ -132,7 +161,7 @@ def _asn_path(hops: Iterable[Hop]) -> list[int]:
     return path
 
 
-def classify_route(hops: Sequence[Hop]) -> tuple[str, str, str]:
+def classify_route(hops: Sequence[Hop], target_isp: Optional[str] = None) -> tuple[str, str, str]:
     """Return (route label, upstream ASN, status), using ASN order as evidence."""
     path = _asn_path(hops)
     if not hops:
@@ -145,9 +174,14 @@ def classify_route(hops: Sequence[Hop]) -> tuple[str, str, str]:
             if asn not in {0, 23456}:
                 upstream = f"AS{asn}"
                 break
+    elif len(path) > 1:
+        for asn in reversed(path[:-1]):
+            if asn not in {0, 23456}:
+                upstream = f"AS{asn}"
+                break
 
     aset = set(path)
-    route = "Hidden"
+    route = ""
     if 23764 in aset:
         route = "CTG GIA"
     elif 4809 in aset:
@@ -180,7 +214,17 @@ def classify_route(hops: Sequence[Hop]) -> tuple[str, str, str]:
         route = "163"
 
     visible = sum(1 for hop in hops if hop.ip)
-    status = "ok" if route != "Hidden" else ("hidden" if visible else "error")
+    if route:
+        status = "ok"
+    elif visible and target_isp in ISP_NAMES:
+        route = f"{ISP_NAMES[target_isp]}接入"
+        status = "partial"
+    elif visible:
+        route = "未识别"
+        status = "partial"
+    else:
+        route = "Unknown"
+        status = "error"
     return route, upstream, status
 
 
@@ -331,6 +375,14 @@ def recommended_parallel(available_mib: Optional[int] = None, total_mib: Optiona
     return min(PARALLEL_MAX, available_limit, total_limit)
 
 
+def progress_line(done: int, total: int, label: str = "", width: int = 24) -> str:
+    ratio = 1.0 if total <= 0 else min(1.0, max(0.0, done / total))
+    filled = int(ratio * width)
+    bar = "█" * filled + "░" * (width - filled)
+    suffix = f"  {label}" if label else ""
+    return f"[{bar}] {done}/{total} {int(ratio * 100):3d}%{suffix}"
+
+
 def trace_one(binary: str, city: str, isp: str, family: int, protocol: str, timeout: float, max_hops: int, queries: int, details: bool) -> RouteResult:
     target = target_name(city, isp, family)
     started = time.monotonic()
@@ -364,7 +416,7 @@ def trace_one(binary: str, city: str, isp: str, family: int, protocol: str, time
         error = str(exc)
     elapsed = int((time.monotonic() - started) * 1000)
     hops = parse_nexttrace(output)
-    route, upstream, status = classify_route(hops)
+    route, upstream, status = classify_route(hops, isp)
     if error and not hops:
         status = "error"
     return RouteResult(
@@ -387,7 +439,7 @@ def make_parser() -> argparse.ArgumentParser:
     auto_parallel = recommended_parallel()
     parser = argparse.ArgumentParser(description="快速识别中国大陆三网回程线路")
     parser.add_argument("--ipv6", action="store_true", help="测试 IPv6（默认 IPv4）")
-    parser.add_argument("--city", default=",".join(DEFAULT_CITIES), help="城市: bj,sh,gd，可逗号分隔")
+    parser.add_argument("--province", "--city", dest="city", metavar="CODE", default=",".join(DEFAULT_CITIES), help="省份代码，可逗号分隔；默认大陆 31 个省级行政区")
     parser.add_argument("--isp", default=",".join(DEFAULT_ISPS), help="运营商: ct,cu,cm，可逗号分隔")
     parser.add_argument("--protocol", choices=("tcp", "udp", "icmp"), default="tcp")
     parser.add_argument("--parallel", type=int, default=auto_parallel, help=f"并发任务数，1-18；按可用内存自动选择，当前默认 {auto_parallel}")
@@ -398,6 +450,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--classify-file", help="仅解析保存的 NextTrace 文本")
     parser.add_argument("--json", action="store_true", help="输出 JSON")
     parser.add_argument("--details", action="store_true", help="保留并显示原始追踪输出")
+    parser.add_argument("--no-progress", action="store_true", help="不显示实时进度条")
     parser.add_argument("--no-color", action="store_true", help="禁用颜色（当前表格默认无颜色）")
     parser.add_argument("--version", action="version", version=f"QuickRoute {VERSION}")
     return parser
@@ -418,20 +471,34 @@ def payload(args: argparse.Namespace, results: Sequence[RouteResult]) -> dict[st
 
 
 def print_table(results: Sequence[RouteResult], details: bool) -> None:
-    headers = ("城市", "运营商", "线路", "上游", "跳数", "耗时", "状态")
+    present_isps = [isp for isp in DEFAULT_ISPS if any(result.isp == isp for result in results)]
+    headers = ("省份", *(ISP_NAMES[isp] for isp in present_isps))
     rows: list[tuple[str, ...]] = [headers]
-    for r in results:
-        state = f"error: {r.error}" if r.status == "error" and r.error else r.status
-        rows.append((r.city_name, r.isp_name, r.route, r.upstream, str(r.hop_count or "-"), f"{r.elapsed_ms / 1000:.1f}s", state))
+    city_order = list(dict.fromkeys(result.city for result in results))
+    indexed = {(result.city, result.isp): result for result in results}
+    for city in city_order:
+        cells = []
+        for isp in present_isps:
+            result = indexed.get((city, isp))
+            cells.append("错误" if result is None or result.status == "error" else result.route)
+        rows.append((CITY_NAMES.get(city, city), *cells))
+
     def display_width(value: str) -> int:
         return sum(2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1 for char in value)
+
     def pad(value: str, width: int) -> str:
         return value + " " * (width - display_width(value))
+
     widths = [max(display_width(row[i]) for row in rows) for i in range(len(headers))]
     for index, row in enumerate(rows):
         print("  ".join(pad(value, widths[i]) for i, value in enumerate(row)))
         if index == 0:
             print("  ".join("-" * width for width in widths))
+    failures = [result for result in results if result.status == "error"]
+    if failures:
+        print("\n失败详情：")
+        for result in failures:
+            print(f"- {result.city_name}{result.isp_name}: {result.error or '没有可解析的路由输出'}")
     if details:
         for result in results:
             print(f"\n## {result.city_name}{result.isp_name} {result.target}\n{result.output or result.error or '(no output)'}")
@@ -439,7 +506,7 @@ def print_table(results: Sequence[RouteResult], details: bool) -> None:
 
 def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> tuple[list[str], list[str]]:
     try:
-        cities = _csv_choices(args.city, CITY_NAMES, "城市")
+        cities = _csv_choices(args.city, CITY_NAMES, "省份")
         isps = _csv_choices(args.isp, ISP_NAMES, "运营商")
     except argparse.ArgumentTypeError as exc:
         parser.error(str(exc))
@@ -473,6 +540,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         family = 6 if args.ipv6 else 4
         tasks = [(city, isp) for city in cities for isp in isps]
         results = []
+        show_progress = not args.no_progress and not args.json
+        if show_progress:
+            print(f"检测 {len(cities)} 个省级行政区、{len(tasks)} 条三网回程，并发 {min(args.parallel, len(tasks))}", file=sys.stderr)
+            print("\r" + progress_line(0, len(tasks)), end="", file=sys.stderr, flush=True)
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.parallel, len(tasks))) as pool:
             futures = {pool.submit(trace_one, binary, city, isp, family, args.protocol, args.timeout, args.max_hops, args.queries, args.details): (city, isp) for city, isp in tasks}
             for future in concurrent.futures.as_completed(futures):
@@ -485,6 +556,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         args.protocol, family, "Unknown", "-", 0, 0, "error",
                         f"worker error: {exc}", [], None,
                     ))
+                if show_progress:
+                    label = f"{CITY_NAMES[city]}{ISP_NAMES[isp]}"
+                    print("\r" + progress_line(len(results), len(tasks), label), end="", file=sys.stderr, flush=True)
+        if show_progress:
+            print(file=sys.stderr)
         order = {(city, isp): idx for idx, (city, isp) in enumerate(tasks)}
         results.sort(key=lambda r: order[(r.city, r.isp)])
     if args.json:

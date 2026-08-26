@@ -9,11 +9,12 @@ it is not a verbatim distribution of any referenced project.
 1. xykt/NetQuality
    https://github.com/xykt/NetQuality
    License: GNU AGPL v3
-   QuickRoute derives its mainland return-route test matrix (Beijing,
-   Shanghai and Guangdong across China Telecom, China Unicom and China
-   Mobile), zstaticcdn target naming convention, parallel trace workflow,
-   and ASN-based route-label concept from NetQuality. The implementation
-   in this repository was rewritten in Python and remains AGPL-3.0.
+   QuickRoute derives its mainland provincial code list and return-route
+   test matrix (31 provincial-level regions across China Telecom, China
+   Unicom and China Mobile), zstaticcdn target naming convention, parallel
+   trace workflow, and ASN/IP-prefix route-label concept from NetQuality.
+   The implementation in this repository was rewritten in Python and
+   remains AGPL-3.0.
 
 2. LloydAsp/NodeQuality
    https://github.com/LloydAsp/NodeQuality

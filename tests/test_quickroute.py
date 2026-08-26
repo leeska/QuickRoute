@@ -28,6 +28,10 @@ def trace(*asns):
 
 
 class ParseTests(unittest.TestCase):
+    def test_infers_backbone_asn_from_known_ip_prefix(self):
+        hops = qr.parse_nexttrace("1  59.43.1.1  10 ms\n2  219.158.1.1  20 ms\n3  223.120.1.1  30 ms")
+        self.assertEqual([hop.asn for hop in hops], [4809, 4837, 58453])
+
     def test_parse_text_and_preserve_ecmp_ttl(self):
         text = """
 traceroute to x (1.1.1.1), 30 hops max
@@ -84,8 +88,11 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(self.classify(6939, 23910)[0], "CERNET2")
         self.assertEqual(self.classify(6939, 7497)[0], "CSTNET")
 
-    def test_hidden_and_empty(self):
-        self.assertEqual(self.classify(3356)[0], "Hidden")
+    def test_access_fallback_and_empty(self):
+        hops = qr.parse_nexttrace(trace(6453, 58466))
+        self.assertEqual(qr.classify_route(hops, "ct"), ("电信接入", "AS6453", "partial"))
+        self.assertEqual(qr.classify_route(hops, "cu")[0], "联通接入")
+        self.assertEqual(qr.classify_route(hops, "cm")[0], "移动接入")
         self.assertEqual(qr.classify_route([]), ("Unknown", "-", "error"))
 
 
@@ -159,6 +166,35 @@ class DownloadTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_default_covers_mainland_provinces_and_three_isps(self):
+        args = qr.make_parser().parse_args([])
+        provinces, isps = qr.validate_args(qr.make_parser(), args)
+        self.assertEqual(len(provinces), 31)
+        self.assertEqual(len(provinces) * len(isps), 93)
+        self.assertEqual(qr.CITY_NAMES["he"], "河北")
+        self.assertEqual(qr.CITY_NAMES["cq"], "重庆")
+
+    def test_progress_line(self):
+        line = qr.progress_line(31, 93, "河北电信", width=10)
+        self.assertIn("31/93", line)
+        self.assertIn("33%", line)
+        self.assertIn("河北电信", line)
+
+    def test_matrix_table_has_no_hidden_label(self):
+        results = [
+            qr.RouteResult("he", "河北", isp, qr.ISP_NAMES[isp], "x", "tcp", 4,
+                           route, "AS6453", 10, 1000, "partial", None, [])
+            for isp, route in (("ct", "电信接入"), ("cu", "4837"), ("cm", "CMI"))
+        ]
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            qr.print_table(results, False)
+        output = stdout.getvalue()
+        self.assertIn("省份", output)
+        self.assertIn("河北", output)
+        self.assertIn("电信接入", output)
+        self.assertNotIn("Hidden", output)
+
     def test_memory_aware_parallelism(self):
         self.assertEqual(qr.recommended_parallel(80, 128), 1)
         self.assertEqual(qr.recommended_parallel(186, 256), 3)
