@@ -1,4 +1,6 @@
+import contextlib
 import hashlib
+import io
 import json
 import subprocess
 import sys
@@ -85,11 +87,21 @@ class ClassificationTests(unittest.TestCase):
 class DownloadTests(unittest.TestCase):
     def test_asset_selection(self):
         digest = "sha256:" + "a" * 64
-        release = {"assets": [{"name": "nexttrace-tiny_linux_amd64", "digest": digest, "browser_download_url": "https://example.test/x"}]}
+        release = {"assets": [{"name": "nexttrace-tiny_linux_amd64", "digest": digest, "size": 123, "browser_download_url": "https://example.test/x"}]}
         self.assertEqual(qr.select_release_asset(release, "x86_64")["digest"], digest)
 
     def test_asset_requires_digest(self):
-        release = {"assets": [{"name": "nexttrace-tiny_linux_amd64", "browser_download_url": "x"}]}
+        release = {"assets": [{"name": "nexttrace-tiny_linux_amd64", "size": 123, "browser_download_url": "x"}]}
+        with self.assertRaises(RuntimeError):
+            qr.select_release_asset(release, "amd64")
+
+    def test_asset_rejects_oversize(self):
+        release = {"assets": [{
+            "name": "nexttrace-tiny_linux_amd64",
+            "digest": "sha256:" + "a" * 64,
+            "size": qr.MAX_DOWNLOAD_BYTES + 1,
+            "browser_download_url": "x",
+        }]}
         with self.assertRaises(RuntimeError):
             qr.select_release_asset(release, "amd64")
 
@@ -104,30 +116,41 @@ class DownloadTests(unittest.TestCase):
             qr.verify_digest(data, "sha256:" + "0" * 64)
 
     @mock.patch("quickroute_lib.platform.machine", return_value="x86_64")
-    @mock.patch("quickroute_lib._bytes_url")
+    @mock.patch("quickroute_lib._download_to_file")
     @mock.patch("quickroute_lib._json_url")
     @mock.patch("quickroute_lib.shutil.which", return_value=None)
-    def test_download_to_cache(self, _which, json_url, bytes_url, _machine):
+    def test_download_to_cache(self, _which, json_url, download_to_file, _machine):
         data = b"binary"
         json_url.return_value = {
             "tag_name": "v-test",
             "assets": [{
                 "name": "nexttrace-tiny_linux_amd64",
                 "digest": "sha256:" + hashlib.sha256(data).hexdigest(),
+                "size": len(data),
                 "browser_download_url": "https://example.test/bin",
             }],
         }
-        bytes_url.return_value = data
+        download_to_file.side_effect = lambda _url, destination, _digest, _size: destination.write_bytes(data)
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict("os.environ", {"XDG_CACHE_HOME": directory}, clear=False):
             path = Path(qr.ensure_nexttrace())
             self.assertEqual(path.read_bytes(), data)
             self.assertTrue(path.stat().st_mode & 0o100)
             path.write_bytes(b"tampered")
             path.chmod(0o700)
-            bytes_url.reset_mock()
+            download_to_file.reset_mock()
             repaired = Path(qr.ensure_nexttrace())
             self.assertEqual(repaired.read_bytes(), data)
-            bytes_url.assert_called_once()
+            download_to_file.assert_called_once()
+
+    @mock.patch("quickroute_lib.urllib.request.urlopen")
+    def test_download_rejects_large_content_length(self, urlopen):
+        response = mock.MagicMock()
+        response.headers = {"Content-Length": str(qr.MAX_DOWNLOAD_BYTES + 1)}
+        response.__enter__.return_value = response
+        urlopen.return_value = response
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(RuntimeError):
+                qr._download_to_file("https://example.test/bin", Path(directory) / "bin", "sha256:" + "0" * 64, 1)
 
 
 class CliTests(unittest.TestCase):
@@ -139,6 +162,26 @@ class CliTests(unittest.TestCase):
             result = qr.trace_one(str(binary), "gd", "ct", 4, "tcp", 2, 10, 1, True)
             self.assertEqual(result.status, "error")
             self.assertIn("�", result.output or "")
+
+    def test_trace_timeout_is_structured(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "nexttrace"
+            binary.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(60)\n", encoding="utf-8")
+            binary.chmod(0o700)
+            result = qr.trace_one(str(binary), "gd", "ct", 4, "tcp", 0.1, 10, 1, False)
+            self.assertEqual(result.status, "error")
+            self.assertIn("timeout", result.error or "")
+
+    @mock.patch("quickroute_lib.ensure_nexttrace", return_value="nexttrace")
+    @mock.patch("quickroute_lib.trace_one", side_effect=RuntimeError("boom"))
+    def test_worker_exception_does_not_abort_report(self, _trace, _ensure):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = qr.main(["--city", "gd", "--isp", "ct", "--json"])
+        data = json.loads(stdout.getvalue())
+        self.assertEqual(code, 1)
+        self.assertEqual(data["results"][0]["status"], "error")
+        self.assertIn("worker error", data["results"][0]["error"])
 
     def test_classify_file_json_schema(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -11,6 +11,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -22,9 +23,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 SCHEMA_VERSION = "1.0"
 RELEASE_API = "https://api.github.com/repos/nxtrace/NTrace-core/releases/latest"
+MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
+DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 CITY_NAMES = {"bj": "北京", "sh": "上海", "gd": "广东"}
 ISP_NAMES = {"ct": "电信", "cu": "联通", "cm": "移动"}
 DEFAULT_CITIES = ("bj", "sh", "gd")
@@ -191,6 +194,9 @@ def select_release_asset(release: dict[str, Any], machine: Optional[str] = None)
                 raise RuntimeError(f"发布资源 {wanted} 缺少可信 SHA256 digest")
             if not asset.get("browser_download_url"):
                 raise RuntimeError(f"发布资源 {wanted} 缺少下载地址")
+            size = asset.get("size")
+            if not isinstance(size, int) or not 0 < size <= MAX_DOWNLOAD_BYTES:
+                raise RuntimeError(f"发布资源 {wanted} 大小无效或超过 {MAX_DOWNLOAD_BYTES // (1024 * 1024)} MiB")
             return asset
     raise RuntimeError(f"最新版本没有适配资源: {wanted}")
 
@@ -208,10 +214,44 @@ def _json_url(url: str) -> dict[str, Any]:
         return json.load(response)
 
 
-def _bytes_url(url: str) -> bytes:
+def _verify_file_digest(path: Path, digest: str) -> None:
+    expected = digest.split(":", 1)[1].lower()
+    hasher = hashlib.sha256()
+    total = 0
+    with path.open("rb") as handle:
+        while chunk := handle.read(DOWNLOAD_CHUNK_BYTES):
+            total += len(chunk)
+            if total > MAX_DOWNLOAD_BYTES:
+                raise RuntimeError("缓存文件超过下载大小上限")
+            hasher.update(chunk)
+    actual = hasher.hexdigest()
+    if actual != expected:
+        raise RuntimeError(f"SHA256 校验失败: expected {expected}, got {actual}")
+
+
+def _download_to_file(url: str, destination: Path, digest: str, expected_size: int) -> None:
     request = urllib.request.Request(url, headers={"User-Agent": f"QuickRoute/{VERSION}"})
     with urllib.request.urlopen(request, timeout=120) as response:
-        return response.read()
+        content_length = response.headers.get("Content-Length")
+        if content_length and int(content_length) > MAX_DOWNLOAD_BYTES:
+            raise RuntimeError("下载响应超过大小上限")
+        hasher = hashlib.sha256()
+        total = 0
+        with destination.open("wb") as handle:
+            while chunk := response.read(DOWNLOAD_CHUNK_BYTES):
+                total += len(chunk)
+                if total > MAX_DOWNLOAD_BYTES:
+                    raise RuntimeError("下载内容超过大小上限")
+                handle.write(chunk)
+                hasher.update(chunk)
+            handle.flush()
+            os.fsync(handle.fileno())
+    if total != expected_size:
+        raise RuntimeError(f"下载大小不匹配: expected {expected_size}, got {total}")
+    expected = digest.split(":", 1)[1].lower()
+    actual = hasher.hexdigest()
+    if actual != expected:
+        raise RuntimeError(f"SHA256 校验失败: expected {expected}, got {actual}")
 
 
 def ensure_nexttrace(explicit: Optional[str] = None) -> str:
@@ -231,18 +271,14 @@ def ensure_nexttrace(explicit: Optional[str] = None) -> str:
     target = cache_root / f"nexttrace-{tag}-{ARCH_ASSETS[platform.machine().lower()]}"
     if target.is_file() and os.access(target, os.X_OK):
         try:
-            verify_digest(target.read_bytes(), asset["digest"])
+            _verify_file_digest(target, asset["digest"])
             return str(target)
         except RuntimeError:
             pass
-    data = _bytes_url(asset["browser_download_url"])
-    verify_digest(data, asset["digest"])
     fd, tmp_name = tempfile.mkstemp(prefix=".nexttrace-", dir=str(cache_root))
+    os.close(fd)
     try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
+        _download_to_file(asset["browser_download_url"], Path(tmp_name), asset["digest"], asset["size"])
         os.chmod(tmp_name, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
         os.replace(tmp_name, target)
     finally:
@@ -271,21 +307,24 @@ def trace_one(binary: str, city: str, isp: str, family: int, protocol: str, time
     error = None
     output = ""
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             build_command(binary, target, protocol, family, max_hops, queries),
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            encoding="utf-8", errors="replace",
-            timeout=timeout, check=False, env={**os.environ, "TERM": "dumb", "NO_COLOR": "1"},
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env={**os.environ, "TERM": "dumb", "NO_COLOR": "1"},
+            start_new_session=True,
         )
-        output = completed.stdout or ""
-        if completed.returncode != 0:
-            error = f"nexttrace exit {completed.returncode}"
-    except subprocess.TimeoutExpired as exc:
-        if isinstance(exc.stdout, bytes):
-            output = exc.stdout.decode("utf-8", errors="replace")
-        else:
-            output = exc.stdout or ""
-        error = f"timeout after {timeout:g}s"
+        try:
+            output_bytes, _ = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                process.kill()
+            output_bytes, _ = process.communicate()
+            error = f"timeout after {timeout:g}s"
+        output = (output_bytes or b"").decode("utf-8", errors="replace")
+        if process.returncode != 0 and error is None:
+            error = f"nexttrace exit {process.returncode}"
     except OSError as exc:
         error = str(exc)
     elapsed = int((time.monotonic() - started) * 1000)
@@ -400,7 +439,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.parallel, len(tasks))) as pool:
             futures = {pool.submit(trace_one, binary, city, isp, family, args.protocol, args.timeout, args.max_hops, args.queries, args.details): (city, isp) for city, isp in tasks}
             for future in concurrent.futures.as_completed(futures):
-                results.append(future.result())
+                city, isp = futures[future]
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    results.append(RouteResult(
+                        city, CITY_NAMES[city], isp, ISP_NAMES[isp], target_name(city, isp, family),
+                        args.protocol, family, "Unknown", "-", 0, 0, "error",
+                        f"worker error: {exc}", [], None,
+                    ))
         order = {(city, isp): idx for idx, (city, isp) in enumerate(tasks)}
         results.sort(key=lambda r: order[(r.city, r.isp)])
     if args.json:

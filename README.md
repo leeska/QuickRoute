@@ -4,10 +4,10 @@
 
 ## 快速使用
 
-固定 `v0.1.0` 并校验两个入口文件后执行：
+固定 `v0.1.1` 并校验两个入口文件后执行：
 
 ```bash
-d=$(mktemp -d) && base=https://raw.githubusercontent.com/leeska/QuickRoute/v0.1.0 && curl -fsSL "$base/quickroute" -o "$d/quickroute" && curl -fsSL "$base/quickroute_lib.py" -o "$d/quickroute_lib.py" && printf '%s  %s\n%s  %s\n' fc71817cebc49394e4bad9bd6da96efa26a9b207ad0e4dba84282d6ed4705dc4 quickroute d23a6ba667fd51a24d492a5775900a3bbd7f39729eed73fae8b9a8048a10872d quickroute_lib.py | (cd "$d" && sha256sum -c -) && python3 "$d/quickroute"; rc=$?; rm -rf "$d"; exit $rc
+d=$(mktemp -d) && base=https://raw.githubusercontent.com/leeska/QuickRoute/v0.1.1 && curl -fsSL "$base/quickroute" -o "$d/quickroute" && curl -fsSL "$base/quickroute_lib.py" -o "$d/quickroute_lib.py" && printf '%s  %s\n%s  %s\n' fc71817cebc49394e4bad9bd6da96efa26a9b207ad0e4dba84282d6ed4705dc4 quickroute 7a47ebb060bd4df03892669135c7f971386b1543f089a88b0f45213932f88ae5 quickroute_lib.py | (cd "$d" && sha256sum -c -) && python3 "$d/quickroute"; rc=$?; rm -rf "$d"; exit $rc
 ```
 
 或克隆运行：
@@ -51,7 +51,8 @@ cd QuickRoute
 - 默认每目标 1 次查询、最多 24 跳、单任务 20 秒超时，并行执行。
 - 不安装系统包，不执行 `curl | bash`，不创建 chroot/rootfs。
 - 不上传结果、无遥测、无广告。
-- 自动下载仅来自 NextTrace 官方 GitHub Release，并要求 SHA256 digest。
+- 自动下载仅来自 NextTrace 官方 GitHub Release，要求 SHA256 digest，并设有 64 MiB 硬上限。
+- 每条追踪运行在独立进程组；超时会终止整组，单任务内部错误不会中断其他结果。
 
 ## 许可证与来源
 
