@@ -1,0 +1,414 @@
+"""QuickRoute: fast mainland China return-route identification."""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import datetime as dt
+import hashlib
+import ipaddress
+import json
+import os
+import platform
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+import urllib.request
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Iterable, Optional, Sequence
+
+VERSION = "0.1.0"
+SCHEMA_VERSION = "1.0"
+RELEASE_API = "https://api.github.com/repos/nxtrace/NTrace-core/releases/latest"
+CITY_NAMES = {"bj": "北京", "sh": "上海", "gd": "广东"}
+ISP_NAMES = {"ct": "电信", "cu": "联通", "cm": "移动"}
+DEFAULT_CITIES = ("bj", "sh", "gd")
+DEFAULT_ISPS = ("ct", "cu", "cm")
+ARCH_ASSETS = {
+    "x86_64": "amd64", "amd64": "amd64",
+    "aarch64": "arm64", "arm64": "arm64",
+    "armv7l": "armv7", "armv7": "armv7",
+    "armv6l": "armv6", "armv6": "armv6",
+    "i386": "386", "i486": "386", "i586": "386", "i686": "386", "x86": "386",
+}
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+ASN_RE = re.compile(r"\bAS(\d{1,10})\b", re.I)
+HOP_RE = re.compile(r"^\s*(\d{1,3})\s+")
+LATENCY_RE = re.compile(r"(\d+(?:\.\d+)?)\s*ms\b", re.I)
+IP_TOKEN_RE = re.compile(r"(?<![0-9A-Fa-f:.])(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9A-Fa-f:]{2,})(?![0-9A-Fa-f:.])")
+DOMESTIC_ASNS = {
+    4134, 4809, 23764, 4837, 4808, 9929, 10099, 58453, 9808, 58807,
+    4538, 23910, 23911, 7497,
+}
+DOMESTIC_ASNS.update(range(56040, 56049))
+
+
+@dataclass
+class Hop:
+    number: int
+    ip: Optional[str]
+    asn: Optional[int]
+    latency_ms: Optional[float]
+    raw: str
+
+
+@dataclass
+class RouteResult:
+    city: str
+    city_name: str
+    isp: str
+    isp_name: str
+    target: str
+    protocol: str
+    family: int
+    route: str
+    upstream: str
+    hop_count: int
+    elapsed_ms: int
+    status: str
+    error: Optional[str]
+    hops: list[dict[str, Any]]
+    output: Optional[str] = None
+
+
+def _valid_ip(value: str) -> Optional[str]:
+    value = value.strip("[](),")
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        return None
+
+
+def parse_nexttrace(text: str) -> list[Hop]:
+    """Parse ordinary or raw-ish NextTrace text into one representative hop per TTL."""
+    hops: list[Hop] = []
+    seen: set[int] = set()
+    pending: Optional[Hop] = None
+    for original in text.splitlines():
+        line = ANSI_RE.sub("", original).strip()
+        match = HOP_RE.match(line)
+        if not match:
+            if pending and pending.latency_ms is None:
+                latency_match = LATENCY_RE.search(line)
+                if latency_match:
+                    pending.latency_ms = float(latency_match.group(1))
+            continue
+        number = int(match.group(1))
+        if number in seen:
+            continue
+        ip = None
+        for token in IP_TOKEN_RE.findall(line):
+            ip = _valid_ip(token)
+            if ip:
+                break
+        asn_match = ASN_RE.search(line)
+        latency_match = LATENCY_RE.search(line)
+        if not ip and "*" not in line:
+            continue
+        pending = Hop(
+            number=number,
+            ip=ip,
+            asn=int(asn_match.group(1)) if asn_match else None,
+            latency_ms=float(latency_match.group(1)) if latency_match else None,
+            raw=original,
+        )
+        hops.append(pending)
+        seen.add(number)
+    return hops
+
+
+def _asn_path(hops: Iterable[Hop]) -> list[int]:
+    path: list[int] = []
+    for hop in hops:
+        if hop.asn is not None and (not path or path[-1] != hop.asn):
+            path.append(hop.asn)
+    return path
+
+
+def classify_route(hops: Sequence[Hop]) -> tuple[str, str, str]:
+    """Return (route label, upstream ASN, status), using ASN order as evidence."""
+    path = _asn_path(hops)
+    if not hops:
+        return "Unknown", "-", "error"
+    recognized_positions = [(idx, asn) for idx, asn in enumerate(path) if asn in DOMESTIC_ASNS]
+    upstream = "-"
+    if recognized_positions:
+        first_idx = recognized_positions[0][0]
+        for asn in reversed(path[:first_idx]):
+            if asn not in {0, 23456}:
+                upstream = f"AS{asn}"
+                break
+
+    aset = set(path)
+    route = "Hidden"
+    if 23764 in aset:
+        route = "CTG GIA"
+    elif 4809 in aset:
+        first = path.index(4809)
+        downstream = set(path[first + 1:])
+        route = "CN2 GT" if 4134 in downstream else "CN2 GIA"
+    elif 10099 in aset:
+        if 9929 in aset:
+            route = "10099→9929"
+        elif 4837 in aset or 4808 in aset:
+            route = "10099→4837"
+        else:
+            route = "10099"
+    elif 9929 in aset:
+        route = "9929"
+    elif 4837 in aset or 4808 in aset:
+        route = "4837"
+    elif 58807 in aset:
+        first = path.index(58807)
+        route = "CMIN2→CMI" if any(a in {58453, 9808, *range(56040, 56049)} for a in path[first + 1:]) else "CMIN2"
+    elif aset.intersection({58453, 9808, *range(56040, 56049)}):
+        route = "CMI"
+    elif 23911 in aset or 23910 in aset:
+        route = "CERNET2"
+    elif 4538 in aset:
+        route = "CERNET"
+    elif 7497 in aset:
+        route = "CSTNET"
+    elif 4134 in aset:
+        route = "163"
+
+    visible = sum(1 for hop in hops if hop.ip)
+    status = "ok" if route != "Hidden" else ("hidden" if visible else "error")
+    return route, upstream, status
+
+
+def select_release_asset(release: dict[str, Any], machine: Optional[str] = None) -> dict[str, Any]:
+    machine = (machine or platform.machine()).lower()
+    arch = ARCH_ASSETS.get(machine)
+    if not arch:
+        raise RuntimeError(f"不支持的 CPU 架构: {machine}")
+    wanted = f"nexttrace-tiny_linux_{arch}"
+    for asset in release.get("assets", []):
+        if asset.get("name") == wanted:
+            digest = asset.get("digest", "")
+            if not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
+                raise RuntimeError(f"发布资源 {wanted} 缺少可信 SHA256 digest")
+            if not asset.get("browser_download_url"):
+                raise RuntimeError(f"发布资源 {wanted} 缺少下载地址")
+            return asset
+    raise RuntimeError(f"最新版本没有适配资源: {wanted}")
+
+
+def verify_digest(data: bytes, digest: str) -> None:
+    expected = digest.split(":", 1)[1].lower()
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != expected:
+        raise RuntimeError(f"SHA256 校验失败: expected {expected}, got {actual}")
+
+
+def _json_url(url: str) -> dict[str, Any]:
+    request = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": f"QuickRoute/{VERSION}"})
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return json.load(response)
+
+
+def _bytes_url(url: str) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": f"QuickRoute/{VERSION}"})
+    with urllib.request.urlopen(request, timeout=120) as response:
+        return response.read()
+
+
+def ensure_nexttrace(explicit: Optional[str] = None) -> str:
+    if explicit:
+        path = Path(explicit).expanduser()
+        if not path.is_file() or not os.access(path, os.X_OK):
+            raise RuntimeError(f"--nexttrace 不可执行: {path}")
+        return str(path)
+    found = shutil.which("nexttrace-tiny") or shutil.which("nexttrace")
+    if found:
+        return found
+    release = _json_url(RELEASE_API)
+    asset = select_release_asset(release)
+    tag = re.sub(r"[^A-Za-z0-9._-]", "_", str(release.get("tag_name") or "latest"))
+    cache_root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "quickroute"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    target = cache_root / f"nexttrace-{tag}-{ARCH_ASSETS[platform.machine().lower()]}"
+    if target.is_file() and os.access(target, os.X_OK):
+        try:
+            verify_digest(target.read_bytes(), asset["digest"])
+            return str(target)
+        except RuntimeError:
+            pass
+    data = _bytes_url(asset["browser_download_url"])
+    verify_digest(data, asset["digest"])
+    fd, tmp_name = tempfile.mkstemp(prefix=".nexttrace-", dir=str(cache_root))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_name, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+        os.replace(tmp_name, target)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+    return str(target)
+
+
+def target_name(city: str, isp: str, family: int) -> str:
+    return f"{city}-{isp}-v{family}.ip.zstaticcdn.com"
+
+
+def build_command(binary: str, target: str, protocol: str, family: int, max_hops: int, queries: int) -> list[str]:
+    cmd = [binary, f"-{family}", "-n", "-m", str(max_hops), "-q", str(queries), "--parallel-requests", "3"]
+    if protocol == "tcp":
+        cmd += ["-T", "-p", "80"]
+    elif protocol == "udp":
+        cmd += ["-U", "-p", "33494"]
+    cmd.append(target)
+    return cmd
+
+
+def trace_one(binary: str, city: str, isp: str, family: int, protocol: str, timeout: float, max_hops: int, queries: int, details: bool) -> RouteResult:
+    target = target_name(city, isp, family)
+    started = time.monotonic()
+    error = None
+    output = ""
+    try:
+        completed = subprocess.run(
+            build_command(binary, target, protocol, family, max_hops, queries),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            encoding="utf-8", errors="replace",
+            timeout=timeout, check=False, env={**os.environ, "TERM": "dumb", "NO_COLOR": "1"},
+        )
+        output = completed.stdout or ""
+        if completed.returncode != 0:
+            error = f"nexttrace exit {completed.returncode}"
+    except subprocess.TimeoutExpired as exc:
+        if isinstance(exc.stdout, bytes):
+            output = exc.stdout.decode("utf-8", errors="replace")
+        else:
+            output = exc.stdout or ""
+        error = f"timeout after {timeout:g}s"
+    except OSError as exc:
+        error = str(exc)
+    elapsed = int((time.monotonic() - started) * 1000)
+    hops = parse_nexttrace(output)
+    route, upstream, status = classify_route(hops)
+    if error and not hops:
+        status = "error"
+    return RouteResult(
+        city=city, city_name=CITY_NAMES[city], isp=isp, isp_name=ISP_NAMES[isp], target=target,
+        protocol=protocol, family=family, route=route, upstream=upstream,
+        hop_count=max((hop.number for hop in hops), default=0), elapsed_ms=elapsed,
+        status=status, error=error, hops=[asdict(hop) for hop in hops], output=output if details else None,
+    )
+
+
+def _csv_choices(value: str, allowed: dict[str, str], label: str) -> list[str]:
+    values = [item.strip().lower() for item in value.split(",") if item.strip()]
+    bad = [item for item in values if item not in allowed]
+    if not values or bad:
+        raise argparse.ArgumentTypeError(f"{label} 可选值: {','.join(allowed)}")
+    return list(dict.fromkeys(values))
+
+
+def make_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="快速识别中国大陆三网回程线路")
+    parser.add_argument("--ipv6", action="store_true", help="测试 IPv6（默认 IPv4）")
+    parser.add_argument("--city", default=",".join(DEFAULT_CITIES), help="城市: bj,sh,gd，可逗号分隔")
+    parser.add_argument("--isp", default=",".join(DEFAULT_ISPS), help="运营商: ct,cu,cm，可逗号分隔")
+    parser.add_argument("--protocol", choices=("tcp", "udp", "icmp"), default="tcp")
+    parser.add_argument("--parallel", type=int, default=9, help="并发任务数，1-18")
+    parser.add_argument("--timeout", type=float, default=20.0, help="每条路由超时秒数")
+    parser.add_argument("--max-hops", type=int, default=24)
+    parser.add_argument("--queries", type=int, default=1)
+    parser.add_argument("--nexttrace", help="指定 nexttrace/nexttrace-tiny 路径")
+    parser.add_argument("--classify-file", help="仅解析保存的 NextTrace 文本")
+    parser.add_argument("--json", action="store_true", help="输出 JSON")
+    parser.add_argument("--details", action="store_true", help="保留并显示原始追踪输出")
+    parser.add_argument("--no-color", action="store_true", help="禁用颜色（当前表格默认无颜色）")
+    parser.add_argument("--version", action="version", version=f"QuickRoute {VERSION}")
+    return parser
+
+
+def payload(args: argparse.Namespace, results: Sequence[RouteResult]) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "tool_version": VERSION,
+        "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "options": {
+            "family": 6 if args.ipv6 else 4, "protocol": args.protocol,
+            "parallel": args.parallel, "timeout": args.timeout,
+            "max_hops": args.max_hops, "queries": args.queries,
+        },
+        "results": [asdict(result) for result in results],
+    }
+
+
+def print_table(results: Sequence[RouteResult], details: bool) -> None:
+    headers = ("城市", "运营商", "线路", "上游", "跳数", "耗时", "状态")
+    rows: list[tuple[str, ...]] = [headers]
+    for r in results:
+        rows.append((r.city_name, r.isp_name, r.route, r.upstream, str(r.hop_count or "-"), f"{r.elapsed_ms / 1000:.1f}s", r.status))
+    def display_width(value: str) -> int:
+        return sum(2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1 for char in value)
+    def pad(value: str, width: int) -> str:
+        return value + " " * (width - display_width(value))
+    widths = [max(display_width(row[i]) for row in rows) for i in range(len(headers))]
+    for index, row in enumerate(rows):
+        print("  ".join(pad(value, widths[i]) for i, value in enumerate(row)))
+        if index == 0:
+            print("  ".join("-" * width for width in widths))
+    if details:
+        for result in results:
+            print(f"\n## {result.city_name}{result.isp_name} {result.target}\n{result.output or result.error or '(no output)'}")
+
+
+def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> tuple[list[str], list[str]]:
+    try:
+        cities = _csv_choices(args.city, CITY_NAMES, "城市")
+        isps = _csv_choices(args.isp, ISP_NAMES, "运营商")
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
+    if not 1 <= args.parallel <= 18:
+        parser.error("--parallel 必须在 1-18")
+    if not 1 <= args.timeout <= 120:
+        parser.error("--timeout 必须在 1-120")
+    if not 1 <= args.max_hops <= 64:
+        parser.error("--max-hops 必须在 1-64")
+    if not 1 <= args.queries <= 5:
+        parser.error("--queries 必须在 1-5")
+    return cities, isps
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = make_parser()
+    args = parser.parse_args(argv)
+    cities, isps = validate_args(parser, args)
+    if args.classify_file:
+        text = Path(args.classify_file).read_text(encoding="utf-8", errors="replace")
+        hops = parse_nexttrace(text)
+        route, upstream, status = classify_route(hops)
+        result = RouteResult("file", "文件", "unknown", "未知", args.classify_file, args.protocol, 6 if args.ipv6 else 4, route, upstream, max((h.number for h in hops), default=0), 0, status, None, [asdict(h) for h in hops], text if args.details else None)
+        results = [result]
+    else:
+        try:
+            binary = ensure_nexttrace(args.nexttrace)
+        except Exception as exc:
+            print(f"QuickRoute: {exc}", file=sys.stderr)
+            return 2
+        family = 6 if args.ipv6 else 4
+        tasks = [(city, isp) for city in cities for isp in isps]
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.parallel, len(tasks))) as pool:
+            futures = {pool.submit(trace_one, binary, city, isp, family, args.protocol, args.timeout, args.max_hops, args.queries, args.details): (city, isp) for city, isp in tasks}
+            for future in concurrent.futures.as_completed(futures):
+                results.append(future.result())
+        order = {(city, isp): idx for idx, (city, isp) in enumerate(tasks)}
+        results.sort(key=lambda r: order[(r.city, r.isp)])
+    if args.json:
+        print(json.dumps(payload(args, results), ensure_ascii=False, indent=2))
+    else:
+        print_table(results, args.details)
+    return 0 if any(result.status != "error" for result in results) else 1

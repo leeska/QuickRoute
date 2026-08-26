@@ -1,0 +1,37 @@
+QuickRoute attribution and notices
+=================================
+
+QuickRoute is licensed under GNU Affero General Public License v3.0.
+This project is a rewritten and modified implementation dated 2026-08-26;
+it is not a verbatim distribution of any referenced project.
+
+1. xykt/NetQuality
+   https://github.com/xykt/NetQuality
+   License: GNU AGPL v3
+   QuickRoute derives its mainland return-route test matrix (Beijing,
+   Shanghai and Guangdong across China Telecom, China Unicom and China
+   Mobile), zstaticcdn target naming convention, parallel trace workflow,
+   and ASN-based route-label concept from NetQuality. The implementation
+   in this repository was rewritten in Python and remains AGPL-3.0.
+
+2. LloydAsp/NodeQuality
+   https://github.com/LloydAsp/NodeQuality
+   License: GNU AGPL v3
+   Consulted as an integration reference showing the return-route feature
+   exposed through Net.Check.Place/NetQuality. No sandbox, upload, report,
+   hardware-test or unrelated NodeQuality code is included.
+
+3. ibsgss/TcpQuality
+   https://github.com/ibsgss/TcpQuality
+   The inspected repository did not declare a software license. It was
+   used only as a functional comparison for a fast route-only user
+   experience. No TcpQuality source code, comments, private APIs, node
+   data, or distinctive prefix tables were copied.
+
+4. nxtrace/NTrace-core (NextTrace)
+   https://github.com/nxtrace/NTrace-core
+   License: GNU GPL v3
+   QuickRoute invokes NextTrace as a separate external command. When it is
+   absent, QuickRoute can download an official release binary and verify
+   the SHA256 digest published in the GitHub Release API. NextTrace source
+   code is not embedded in this repository.
