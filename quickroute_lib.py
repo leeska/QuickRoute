@@ -85,9 +85,8 @@ def _valid_ip(value: str) -> Optional[str]:
 
 
 def parse_nexttrace(text: str) -> list[Hop]:
-    """Parse ordinary or raw-ish NextTrace text into one representative hop per TTL."""
+    """Parse ordinary or raw-ish NextTrace text, preserving ECMP replies per TTL."""
     hops: list[Hop] = []
-    seen: set[int] = set()
     pending: Optional[Hop] = None
     for original in text.splitlines():
         line = ANSI_RE.sub("", original).strip()
@@ -99,8 +98,6 @@ def parse_nexttrace(text: str) -> list[Hop]:
                     pending.latency_ms = float(latency_match.group(1))
             continue
         number = int(match.group(1))
-        if number in seen:
-            continue
         ip = None
         for token in IP_TOKEN_RE.findall(line):
             ip = _valid_ip(token)
@@ -118,7 +115,6 @@ def parse_nexttrace(text: str) -> list[Hop]:
             raw=original,
         )
         hops.append(pending)
-        seen.add(number)
     return hops
 
 

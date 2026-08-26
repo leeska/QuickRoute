@@ -4,10 +4,10 @@
 
 ## 快速使用
 
-安全的一行命令（先下载到临时文件，再执行）：
+固定 `v0.1.0` 并校验两个入口文件后执行：
 
 ```bash
-d=$(mktemp -d) && curl -fsSL https://raw.githubusercontent.com/leeska/QuickRoute/main/quickroute -o "$d/quickroute" && curl -fsSL https://raw.githubusercontent.com/leeska/QuickRoute/main/quickroute_lib.py -o "$d/quickroute_lib.py" && python3 "$d/quickroute"; rc=$?; rm -rf "$d"; exit $rc
+d=$(mktemp -d) && base=https://raw.githubusercontent.com/leeska/QuickRoute/v0.1.0 && curl -fsSL "$base/quickroute" -o "$d/quickroute" && curl -fsSL "$base/quickroute_lib.py" -o "$d/quickroute_lib.py" && printf '%s  %s\n%s  %s\n' fc71817cebc49394e4bad9bd6da96efa26a9b207ad0e4dba84282d6ed4705dc4 quickroute d23a6ba667fd51a24d492a5775900a3bbd7f39729eed73fae8b9a8048a10872d quickroute_lib.py | (cd "$d" && sha256sum -c -) && python3 "$d/quickroute"; rc=$?; rm -rf "$d"; exit $rc
 ```
 
 或克隆运行：

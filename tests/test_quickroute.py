@@ -21,7 +21,7 @@ def trace(*asns):
 
 
 class ParseTests(unittest.TestCase):
-    def test_parse_text_and_dedupe_ttl(self):
+    def test_parse_text_and_preserve_ecmp_ttl(self):
         text = """
 traceroute to x (1.1.1.1), 30 hops max
  1  10.0.0.1  AS64512  0.30 ms
@@ -30,11 +30,12 @@ traceroute to x (1.1.1.1), 30 hops max
  3  59.43.1.2 AS4809 23.0 ms
 """
         hops = qr.parse_nexttrace(text)
-        self.assertEqual([h.number for h in hops], [1, 2, 3])
+        self.assertEqual([h.number for h in hops], [1, 2, 3, 3])
         self.assertEqual(hops[0].asn, 64512)
         self.assertIsNone(hops[1].ip)
         self.assertEqual(hops[2].asn, 4809)
         self.assertEqual(hops[2].latency_ms, 22.5)
+        self.assertEqual(hops[3].ip, "59.43.1.2")
 
     def test_ignores_header_address(self):
         hops = qr.parse_nexttrace("66.187.6.8 -> 1.1.1.1, 24 hops max\n1 203.0.113.1 AS4134 5 ms")
