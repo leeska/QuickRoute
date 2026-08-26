@@ -37,3 +37,11 @@ it is not a verbatim distribution of any referenced project.
    absent, QuickRoute can download an official release binary and verify
    the SHA256 digest published in the GitHub Release API. NextTrace source
    code is not embedded in this repository.
+
+5. Team Cymru IP to ASN Mapping Service
+   https://www.team-cymru.com/ip-asn-mapping
+   QuickRoute can submit visible public traceroute IP addresses that lack ASN
+   metadata to the public bulk WHOIS service. This is an optional network
+   lookup, can be disabled with --no-asn-query, and does not upload a complete
+   QuickRoute report. The WHOIS transport uses unencrypted TCP port 43 and is
+   therefore an explicit third-party privacy and integrity trust boundary.

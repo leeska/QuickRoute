@@ -56,6 +56,10 @@ traceroute to x (1.1.1.1), 30 hops max
         hops = qr.parse_nexttrace("1   203.0.113.1 AS4134 provider\n    12.34 ms")
         self.assertEqual(hops[0].latency_ms, 12.34)
 
+    def test_parses_announced_target_ip(self):
+        text = "66.187.6.8 -> 112.64.235.107 (sh-cu-v4.ip.zstaticcdn.com), 24 hops max"
+        self.assertEqual(qr.parse_target_ip(text), "112.64.235.107")
+
 
 class ClassificationTests(unittest.TestCase):
     def classify(self, *asns):
@@ -90,10 +94,22 @@ class ClassificationTests(unittest.TestCase):
 
     def test_access_fallback_and_empty(self):
         hops = qr.parse_nexttrace(trace(6453, 58466))
-        self.assertEqual(qr.classify_route(hops, "ct"), ("电信接入", "AS6453", "partial"))
-        self.assertEqual(qr.classify_route(hops, "cu")[0], "联通接入")
-        self.assertEqual(qr.classify_route(hops, "cm")[0], "移动接入")
+        target_ip = hops[-1].ip
+        self.assertEqual(qr.classify_route(hops, "ct", target_ip), ("电信接入", "AS6453", "partial"))
+        self.assertEqual(qr.classify_route(hops, "cu", target_ip)[0], "联通接入")
+        self.assertEqual(qr.classify_route(hops, "cm", target_ip)[0], "移动接入")
+        self.assertEqual(qr.classify_route(hops, "ct", "198.51.100.1")[0], "未识别")
         self.assertEqual(qr.classify_route([]), ("Unknown", "-", "error"))
+
+    def test_final_inference_is_marked(self):
+        result = qr.RouteResult("gd", "广东", "ct", "电信", "x", "tcp", 4,
+                                "电信接入", "AS6453", 10, 1000, "partial", None, [])
+        qr.finalize_inferred([result])
+        self.assertEqual((result.route, result.status), ("163*", "inferred"))
+        result.route = "未识别"
+        result.status = "partial"
+        qr.finalize_inferred([result])
+        self.assertEqual((result.route, result.status), ("未识别", "partial"))
 
 
 class DownloadTests(unittest.TestCase):
@@ -166,6 +182,99 @@ class DownloadTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_parse_cymru_response(self):
+        text = """Bulk mode\n4837 | 219.158.1.1 | 219.158.0.0/20 | CN | apnic | 2002-03-21 | CHINA169\nNA | 192.0.2.1 | NA | ZZ | ripencc | 0 | NA\n"""
+        self.assertEqual(qr.parse_cymru_response(text), {"219.158.1.1": 4837})
+
+    def test_parse_cymru_rejects_unicode_and_out_of_range_asns(self):
+        text = "² | 8.8.8.8 | x\n4294967296 | 1.1.1.1 | x\n"
+        self.assertEqual(qr.parse_cymru_response(text), {})
+
+    def test_cymru_does_not_send_non_global_ips(self):
+        with mock.patch("quickroute.socket.create_connection") as connect:
+            self.assertEqual(qr.query_cymru_asns(["127.0.0.1", "192.0.2.1"]), {})
+        connect.assert_not_called()
+
+    def test_cymru_network_failure_degrades(self):
+        with mock.patch("quickroute.socket.create_connection", side_effect=OSError("blocked")):
+            self.assertEqual(qr.query_cymru_asns(["219.158.1.1"]), {})
+
+    def test_cymru_oversized_response_degrades(self):
+        connection = mock.MagicMock()
+        connection.__enter__.return_value = connection
+        connection.recv.side_effect = [b"12345", b""]
+        with mock.patch("quickroute.MAX_CYMRU_RESPONSE_BYTES", 4), \
+             mock.patch("quickroute.socket.create_connection", return_value=connection):
+            self.assertEqual(qr.query_cymru_asns(["219.158.1.1"]), {})
+
+    def test_cymru_uses_total_deadline(self):
+        connection = mock.MagicMock()
+        connection.__enter__.return_value = connection
+        connection.recv.side_effect = [b"4837 | 219.158.1.1 | x\n", b""]
+        with mock.patch("quickroute.socket.create_connection", return_value=connection), \
+             mock.patch("quickroute.time.monotonic", side_effect=[0.0, 0.0, 0.0, 2.0]):
+            self.assertEqual(qr.query_cymru_asns(["219.158.1.1"], timeout=1.0), {})
+
+    def test_enrich_results_reclassifies_missing_asn(self):
+        result = qr.RouteResult(
+            "he", "河北", "cu", "联通", "x", "tcp", 4, "联通接入", "AS174",
+            2, 1000, "partial", None,
+            [
+                {"number": 1, "ip": "203.0.113.1", "asn": 174, "latency_ms": 1.0, "raw": ""},
+                {"number": 2, "ip": "219.158.1.1", "asn": None, "latency_ms": 2.0, "raw": ""},
+            ],
+        )
+        with mock.patch("quickroute.query_cymru_asns", return_value={"219.158.1.1": 4837}):
+            qr.enrich_results([result])
+        self.assertEqual((result.route, result.status), ("4837", "ok"))
+        result.hops[1]["asn"] = None
+        result.error = "exit 1"
+        with mock.patch("quickroute.query_cymru_asns", return_value={"219.158.1.1": 4837}):
+            qr.enrich_results([result])
+        self.assertEqual(result.status, "error")
+
+    def test_retry_result_is_used_only_when_stronger(self):
+        original = qr.RouteResult("sh", "上海", "cm", "移动", "x", "tcp", 4,
+                                  "移动接入", "AS6453", 10, 1000, "partial", None, [])
+        retry = qr.RouteResult("sh", "上海", "cm", "移动", "x", "udp", 4,
+                               "CMI", "AS6453", 12, 1500, "ok", None, [])
+        self.assertIs(qr.prefer_route_result(original, retry), retry)
+        self.assertEqual([item["protocol"] for item in retry.attempts], ["tcp", "udp"])
+        retry.status = "partial"
+        self.assertIs(qr.prefer_route_result(original, retry), original)
+
+    def test_nonzero_trace_with_hops_stays_error(self):
+        process = mock.MagicMock()
+        process.communicate.return_value = (
+            b"1.1.1.1 -> 8.8.8.8, 24 hops max\n1 8.8.8.8 1 ms\n", None
+        )
+        process.returncode = 1
+        process.pid = 123
+        with mock.patch("quickroute.subprocess.Popen", return_value=process):
+            result = qr.trace_one("nexttrace", "gd", "ct", 4, "tcp", 1, 24, 1, False)
+        self.assertEqual(result.status, "error")
+        qr.finalize_inferred([result])
+        self.assertEqual(result.status, "error")
+
+    @mock.patch("quickroute.ensure_nexttrace", return_value="nexttrace")
+    @mock.patch("quickroute.query_cymru_asns", return_value={})
+    def test_main_retry_preserves_only_real_attempts(self, _cymru, _ensure):
+        def fake_trace(_binary, city, isp, family, protocol, *_args):
+            status = "partial" if isp == "cu" and protocol == "tcp" else "ok"
+            route = "联通接入" if status == "partial" else ("CMI" if isp == "cm" else "4837")
+            if isp == "cu" and protocol == "udp":
+                status, route = "ok", "4837"
+            return qr.RouteResult(city, qr.CITY_NAMES[city], isp, qr.ISP_NAMES[isp], "x",
+                                  protocol, family, route, "-", 1, 1, status, None, [])
+        stdout = io.StringIO()
+        with mock.patch("quickroute.trace_one", side_effect=fake_trace), contextlib.redirect_stdout(stdout):
+            code = qr.main(["--province", "sh", "--isp", "cu,cm", "--json", "--no-asn-query"])
+        data = json.loads(stdout.getvalue())
+        self.assertEqual(code, 0)
+        by_isp = {item["isp"]: item for item in data["results"]}
+        self.assertEqual([attempt["protocol"] for attempt in by_isp["cu"]["attempts"]], ["tcp", "udp"])
+        self.assertEqual(by_isp["cm"]["attempts"], [])
+
     def test_default_covers_mainland_provinces_and_three_isps(self):
         args = qr.make_parser().parse_args([])
         provinces, isps = qr.validate_args(qr.make_parser(), args)
@@ -239,7 +348,10 @@ class CliTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             data = json.loads(completed.stdout)
-            self.assertEqual(data["schema_version"], "1.0")
+            self.assertEqual(data["schema_version"], "1.1")
+            self.assertEqual(data["tool_version"], "0.3.1")
+            self.assertFalse(data["options"]["retry_partial"])
+            self.assertFalse(data["options"]["asn_query"])
             self.assertEqual(data["tool_version"], qr.VERSION)
             self.assertEqual(data["results"][0]["route"], "CN2 GIA")
             self.assertIn("timestamp", data)

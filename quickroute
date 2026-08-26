@@ -13,6 +13,7 @@ import platform
 import re
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -20,15 +21,16 @@ import tempfile
 import time
 import unicodedata
 import urllib.request
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
-VERSION = "0.3.0"
-SCHEMA_VERSION = "1.0"
+VERSION = "0.3.1"
+SCHEMA_VERSION = "1.1"
 RELEASE_API = "https://api.github.com/repos/nxtrace/NTrace-core/releases/latest"
 MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
 DOWNLOAD_CHUNK_BYTES = 1024 * 1024
+MAX_CYMRU_RESPONSE_BYTES = 4 * 1024 * 1024
 CITY_NAMES = {
     "he": "河北", "sx": "山西", "ln": "辽宁", "jl": "吉林", "hl": "黑龙江",
     "js": "江苏", "zj": "浙江", "ah": "安徽", "fj": "福建", "jx": "江西",
@@ -88,6 +90,8 @@ class RouteResult:
     error: Optional[str]
     hops: list[dict[str, Any]]
     output: Optional[str] = None
+    target_ip: Optional[str] = None
+    attempts: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _valid_ip(value: str) -> Optional[str]:
@@ -161,7 +165,19 @@ def _asn_path(hops: Iterable[Hop]) -> list[int]:
     return path
 
 
-def classify_route(hops: Sequence[Hop], target_isp: Optional[str] = None) -> tuple[str, str, str]:
+def parse_target_ip(text: str) -> Optional[str]:
+    for original in text.splitlines():
+        line = ANSI_RE.sub("", original)
+        if " -> " not in line:
+            continue
+        candidate = line.split(" -> ", 1)[1].strip().split(None, 1)[0].strip("[](),")
+        parsed = _valid_ip(candidate)
+        if parsed:
+            return parsed
+    return None
+
+
+def classify_route(hops: Sequence[Hop], target_isp: Optional[str] = None, target_ip: Optional[str] = None) -> tuple[str, str, str]:
     """Return (route label, upstream ASN, status), using ASN order as evidence."""
     path = _asn_path(hops)
     if not hops:
@@ -214,9 +230,10 @@ def classify_route(hops: Sequence[Hop], target_isp: Optional[str] = None) -> tup
         route = "163"
 
     visible = sum(1 for hop in hops if hop.ip)
+    target_reached = bool(target_ip and any(hop.ip == target_ip for hop in hops))
     if route:
         status = "ok"
-    elif visible and target_isp in ISP_NAMES:
+    elif target_reached and target_isp in ISP_NAMES:
         route = f"{ISP_NAMES[target_isp]}接入"
         status = "partial"
     elif visible:
@@ -383,6 +400,114 @@ def progress_line(done: int, total: int, label: str = "", width: int = 24) -> st
     return f"[{bar}] {done}/{total} {int(ratio * 100):3d}%{suffix}"
 
 
+def parse_cymru_response(text: str) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for line in text.splitlines():
+        fields = [field.strip() for field in line.split("|")]
+        if len(fields) < 2 or not re.fullmatch(r"[0-9]{1,10}", fields[0], re.ASCII):
+            continue
+        try:
+            ip = str(ipaddress.ip_address(fields[1]))
+        except ValueError:
+            continue
+        try:
+            asn = int(fields[0])
+        except ValueError:
+            continue
+        if 1 <= asn <= 4294967295:
+            result[ip] = asn
+    return result
+
+
+def query_cymru_asns(ips: Iterable[str], timeout: float = 20.0) -> dict[str, int]:
+    public_ips = []
+    for value in set(ips):
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError:
+            continue
+        if address.is_global:
+            public_ips.append(str(address))
+    if not public_ips:
+        return {}
+    payload = "begin\nverbose\n" + "\n".join(sorted(public_ips)) + "\nend\n"
+    chunks = []
+    total = 0
+    deadline = time.monotonic() + timeout
+    try:
+        with socket.create_connection(("whois.cymru.com", 43), timeout=max(0.001, deadline - time.monotonic())) as connection:
+            connection.settimeout(max(0.001, deadline - time.monotonic()))
+            connection.sendall(payload.encode("ascii"))
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return {}
+                connection.settimeout(remaining)
+                chunk = connection.recv(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_CYMRU_RESPONSE_BYTES:
+                    raise RuntimeError("Team Cymru 响应超过大小上限")
+                chunks.append(chunk)
+    except (OSError, TimeoutError, RuntimeError):
+        return {}
+    try:
+        return parse_cymru_response(b"".join(chunks).decode("utf-8", errors="replace"))
+    except (ValueError, OverflowError):
+        return {}
+
+
+def enrich_results(results: Sequence[RouteResult]) -> int:
+    missing_ips = {
+        str(hop.get("ip"))
+        for result in results
+        for hop in result.hops
+        if hop.get("ip") and hop.get("asn") is None
+    }
+    asn_map = query_cymru_asns(missing_ips)
+    for result in results:
+        changed = False
+        for hop in result.hops:
+            ip = hop.get("ip")
+            if hop.get("asn") is None and ip in asn_map:
+                hop["asn"] = asn_map[ip]
+                changed = True
+        if changed:
+            hops = [Hop(**hop) for hop in result.hops]
+            result.route, result.upstream, result.status = classify_route(hops, result.isp, result.target_ip)
+            if result.error:
+                result.status = "error"
+    return len(asn_map)
+
+
+def prefer_route_result(original: RouteResult, retry: RouteResult) -> RouteResult:
+    rank = {"error": 0, "partial": 1, "inferred": 1, "ok": 2}
+    attempts = [attempt_summary(original), attempt_summary(retry)]
+    selected = retry if rank.get(retry.status, 0) > rank.get(original.status, 0) else original
+    selected.attempts = attempts
+    return selected
+
+
+def attempt_summary(result: RouteResult) -> dict[str, Any]:
+    return {
+        "protocol": result.protocol,
+        "status": result.status,
+        "route": result.route,
+        "error": result.error,
+        "elapsed_ms": result.elapsed_ms,
+    }
+
+
+def finalize_inferred(results: Sequence[RouteResult]) -> None:
+    labels = {"ct": "163*", "cu": "4837*", "cm": "CMI*"}
+    access_labels = {"ct": "电信接入", "cu": "联通接入", "cm": "移动接入"}
+    for result in results:
+        if result.status == "partial" and result.route == access_labels.get(result.isp):
+            result.route = labels[result.isp]
+            result.status = "inferred"
+
+
 def trace_one(binary: str, city: str, isp: str, family: int, protocol: str, timeout: float, max_hops: int, queries: int, details: bool) -> RouteResult:
     target = target_name(city, isp, family)
     started = time.monotonic()
@@ -416,14 +541,16 @@ def trace_one(binary: str, city: str, isp: str, family: int, protocol: str, time
         error = str(exc)
     elapsed = int((time.monotonic() - started) * 1000)
     hops = parse_nexttrace(output)
-    route, upstream, status = classify_route(hops, isp)
-    if error and not hops:
+    target_ip = parse_target_ip(output)
+    route, upstream, status = classify_route(hops, isp, target_ip)
+    if error:
         status = "error"
     return RouteResult(
         city=city, city_name=CITY_NAMES[city], isp=isp, isp_name=ISP_NAMES[isp], target=target,
         protocol=protocol, family=family, route=route, upstream=upstream,
         hop_count=max((hop.number for hop in hops), default=0), elapsed_ms=elapsed,
         status=status, error=error, hops=[asdict(hop) for hop in hops], output=output if details else None,
+        target_ip=target_ip,
     )
 
 
@@ -451,12 +578,15 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true", help="输出 JSON")
     parser.add_argument("--details", action="store_true", help="保留并显示原始追踪输出")
     parser.add_argument("--no-progress", action="store_true", help="不显示实时进度条")
+    parser.add_argument("--no-retry", action="store_true", help="不对证据不足的 TCP 路由做 UDP 复查")
+    parser.add_argument("--no-asn-query", action="store_true", help="不向 Team Cymru 批量查询可见路由 IP 的 ASN")
     parser.add_argument("--no-color", action="store_true", help="禁用颜色（当前表格默认无颜色）")
     parser.add_argument("--version", action="version", version=f"QuickRoute {VERSION}")
     return parser
 
 
 def payload(args: argparse.Namespace, results: Sequence[RouteResult]) -> dict[str, Any]:
+    network_enrichment = not bool(args.classify_file)
     return {
         "schema_version": SCHEMA_VERSION,
         "tool_version": VERSION,
@@ -465,6 +595,8 @@ def payload(args: argparse.Namespace, results: Sequence[RouteResult]) -> dict[st
             "family": 6 if args.ipv6 else 4, "protocol": args.protocol,
             "parallel": args.parallel, "timeout": args.timeout,
             "max_hops": args.max_hops, "queries": args.queries,
+            "retry_partial": network_enrichment and not args.no_retry,
+            "asn_query": network_enrichment and not args.no_asn_query,
         },
         "results": [asdict(result) for result in results],
     }
@@ -495,6 +627,8 @@ def print_table(results: Sequence[RouteResult], details: bool) -> None:
         if index == 0:
             print("  ".join("-" * width for width in widths))
     failures = [result for result in results if result.status == "error"]
+    if any(result.status == "inferred" for result in results):
+        print("\n* 表示接入网推断：已确认目标运营商，但骨干跳不可见。")
     if failures:
         print("\n失败详情：")
         for result in failures:
@@ -563,6 +697,51 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(file=sys.stderr)
         order = {(city, isp): idx for idx, (city, isp) in enumerate(tasks)}
         results.sort(key=lambda r: order[(r.city, r.isp)])
+        if not args.no_asn_query:
+            if show_progress:
+                print("补查可见路由 IP 的 ASN...", file=sys.stderr, flush=True)
+            enriched = enrich_results(results)
+            if show_progress:
+                print(f"ASN 补查完成：新增 {enriched} 条映射", file=sys.stderr)
+
+        retry_candidates = [result for result in results if result.status in ("partial", "error")] if args.protocol == "tcp" and not args.no_retry else []
+        if retry_candidates:
+            retry_results = []
+            if show_progress:
+                print(f"UDP 复查 {len(retry_candidates)} 条证据不足的路由", file=sys.stderr)
+                print("\r" + progress_line(0, len(retry_candidates)), end="", file=sys.stderr, flush=True)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.parallel, len(retry_candidates))) as pool:
+                retry_futures = {
+                    pool.submit(trace_one, binary, result.city, result.isp, family, "udp", args.timeout, args.max_hops, args.queries, args.details): result
+                    for result in retry_candidates
+                }
+                for future in concurrent.futures.as_completed(retry_futures):
+                    original = retry_futures[future]
+                    try:
+                        retry_results.append(future.result())
+                    except Exception as exc:
+                        retry_results.append(RouteResult(
+                            original.city, original.city_name, original.isp, original.isp_name, original.target,
+                            "udp", family, "Unknown", "-", 0, 0, "error",
+                            f"UDP retry worker error: {exc}", [], None,
+                        ))
+                    if show_progress:
+                        label = f"{original.city_name}{original.isp_name}"
+                        print("\r" + progress_line(len(retry_results), len(retry_candidates), label), end="", file=sys.stderr, flush=True)
+            if show_progress:
+                print(file=sys.stderr)
+                if not args.no_asn_query:
+                    print("补查 UDP 路由 IP 的 ASN...", file=sys.stderr, flush=True)
+            if not args.no_asn_query:
+                enrich_results(retry_results)
+            retry_by_key = {(result.city, result.isp): result for result in retry_results}
+            results = [
+                prefer_route_result(result, retry_by_key[(result.city, result.isp)])
+                if (result.city, result.isp) in retry_by_key else result
+                for result in results
+            ]
+            results.sort(key=lambda r: order[(r.city, r.isp)])
+        finalize_inferred(results)
     if args.json:
         print(json.dumps(payload(args, results), ensure_ascii=False, indent=2))
     else:
