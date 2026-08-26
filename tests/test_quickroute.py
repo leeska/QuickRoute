@@ -159,6 +159,11 @@ class DownloadTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_memory_aware_parallelism(self):
+        self.assertEqual(qr.recommended_parallel(80, 128), 1)
+        self.assertEqual(qr.recommended_parallel(186, 256), 3)
+        self.assertEqual(qr.recommended_parallel(1024, 2048), 9)
+
     def test_invalid_utf8_from_nexttrace_does_not_crash(self):
         with tempfile.TemporaryDirectory() as directory:
             binary = Path(directory) / "nexttrace"

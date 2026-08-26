@@ -24,7 +24,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 SCHEMA_VERSION = "1.0"
 RELEASE_API = "https://api.github.com/repos/nxtrace/NTrace-core/releases/latest"
 MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
@@ -33,6 +33,8 @@ CITY_NAMES = {"bj": "北京", "sh": "上海", "gd": "广东"}
 ISP_NAMES = {"ct": "电信", "cu": "联通", "cm": "移动"}
 DEFAULT_CITIES = ("bj", "sh", "gd")
 DEFAULT_ISPS = ("ct", "cu", "cm")
+PARALLEL_MAX = 9
+PARALLEL_WORKER_MIB = 48
 ARCH_ASSETS = {
     "x86_64": "amd64", "amd64": "amd64",
     "aarch64": "arm64", "arm64": "arm64",
@@ -302,6 +304,33 @@ def build_command(binary: str, target: str, protocol: str, family: int, max_hops
     return cmd
 
 
+def recommended_parallel(available_mib: Optional[int] = None, total_mib: Optional[int] = None) -> int:
+    """Choose safe NextTrace concurrency from currently available memory."""
+    if available_mib is None or total_mib is None:
+        try:
+            for line in Path("/proc/meminfo").read_text().splitlines():
+                if line.startswith("MemAvailable:"):
+                    available_mib = int(line.split()[1]) // 1024
+                elif line.startswith("MemTotal:"):
+                    total_mib = int(line.split()[1]) // 1024
+        except (OSError, ValueError, IndexError):
+            pass
+    if available_mib is None:
+        return 3
+    available_limit = max(1, available_mib // PARALLEL_WORKER_MIB)
+    if total_mib is None:
+        total_limit = PARALLEL_MAX
+    elif total_mib <= 192:
+        total_limit = 1
+    elif total_mib <= 384:
+        total_limit = 3
+    elif total_mib <= 768:
+        total_limit = 5
+    else:
+        total_limit = PARALLEL_MAX
+    return min(PARALLEL_MAX, available_limit, total_limit)
+
+
 def trace_one(binary: str, city: str, isp: str, family: int, protocol: str, timeout: float, max_hops: int, queries: int, details: bool) -> RouteResult:
     target = target_name(city, isp, family)
     started = time.monotonic()
@@ -325,7 +354,12 @@ def trace_one(binary: str, city: str, isp: str, family: int, protocol: str, time
             error = f"timeout after {timeout:g}s"
         output = (output_bytes or b"").decode("utf-8", errors="replace")
         if process.returncode != 0 and error is None:
-            error = f"nexttrace exit {process.returncode}"
+            if process.returncode == -signal.SIGKILL:
+                error = "SIGKILL（可能内存不足/OOM）"
+            elif process.returncode < 0:
+                error = f"signal {-process.returncode}"
+            else:
+                error = f"exit {process.returncode}"
     except OSError as exc:
         error = str(exc)
     elapsed = int((time.monotonic() - started) * 1000)
@@ -350,12 +384,13 @@ def _csv_choices(value: str, allowed: dict[str, str], label: str) -> list[str]:
 
 
 def make_parser() -> argparse.ArgumentParser:
+    auto_parallel = recommended_parallel()
     parser = argparse.ArgumentParser(description="快速识别中国大陆三网回程线路")
     parser.add_argument("--ipv6", action="store_true", help="测试 IPv6（默认 IPv4）")
     parser.add_argument("--city", default=",".join(DEFAULT_CITIES), help="城市: bj,sh,gd，可逗号分隔")
     parser.add_argument("--isp", default=",".join(DEFAULT_ISPS), help="运营商: ct,cu,cm，可逗号分隔")
     parser.add_argument("--protocol", choices=("tcp", "udp", "icmp"), default="tcp")
-    parser.add_argument("--parallel", type=int, default=9, help="并发任务数，1-18")
+    parser.add_argument("--parallel", type=int, default=auto_parallel, help=f"并发任务数，1-18；按可用内存自动选择，当前默认 {auto_parallel}")
     parser.add_argument("--timeout", type=float, default=20.0, help="每条路由超时秒数")
     parser.add_argument("--max-hops", type=int, default=24)
     parser.add_argument("--queries", type=int, default=1)
@@ -386,7 +421,8 @@ def print_table(results: Sequence[RouteResult], details: bool) -> None:
     headers = ("城市", "运营商", "线路", "上游", "跳数", "耗时", "状态")
     rows: list[tuple[str, ...]] = [headers]
     for r in results:
-        rows.append((r.city_name, r.isp_name, r.route, r.upstream, str(r.hop_count or "-"), f"{r.elapsed_ms / 1000:.1f}s", r.status))
+        state = f"error: {r.error}" if r.status == "error" and r.error else r.status
+        rows.append((r.city_name, r.isp_name, r.route, r.upstream, str(r.hop_count or "-"), f"{r.elapsed_ms / 1000:.1f}s", state))
     def display_width(value: str) -> int:
         return sum(2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1 for char in value)
     def pad(value: str, width: int) -> str:
