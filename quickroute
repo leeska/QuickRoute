@@ -25,7 +25,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 SCHEMA_VERSION = "1.1"
 RELEASE_API = "https://api.github.com/repos/nxtrace/NTrace-core/releases/latest"
 MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
@@ -201,9 +201,16 @@ def classify_route(hops: Sequence[Hop], target_isp: Optional[str] = None, target
     if 23764 in aset:
         route = "CTG GIA"
     elif 4809 in aset:
-        first = path.index(4809)
-        downstream = set(path[first + 1:])
-        route = "CN2 GT" if 4134 in downstream else "CN2 GIA"
+        first = next(index for index, hop in enumerate(hops) if hop.asn == 4809)
+        # The trace runs from this host towards the Chinese target, so the
+        # China-side hand-off is what comes after the CN2 hops: GT leaves 59.43.*
+        # for the 163 backbone there, GIA stays on CN2 into the target's
+        # province. AS4134 is not evidence on its own — China Telecom announces
+        # its international entry (218.30.*) and the target province's access
+        # network (110.184.*, …) under that ASN too, so a GIA line carries 4134
+        # hops on both sides of 59.43.* without ever touching 163.
+        handoff = any((hop.ip or "").startswith("202.97.") for hop in hops[first + 1:])
+        route = "CN2 GT" if handoff else "CN2 GIA"
     elif 10099 in aset:
         if 9929 in aset:
             route = "10099→9929"

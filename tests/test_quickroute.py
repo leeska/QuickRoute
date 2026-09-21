@@ -27,6 +27,15 @@ def trace(*asns):
     return "\n".join(lines)
 
 
+def trace_pairs(*pairs):
+    """Build a trace from (asn, ip) pairs so address evidence can be tested."""
+    lines = ["traceroute to example (1.1.1.1), 30 hops max"]
+    for index, (asn, ip) in enumerate(pairs, 1):
+        suffix = f"  AS{asn}" if asn else ""
+        lines.append(f"{index}  {ip}{suffix}  1.{index} ms")
+    return "\n".join(lines)
+
+
 class ParseTests(unittest.TestCase):
     def test_infers_backbone_asn_from_known_ip_prefix(self):
         hops = qr.parse_nexttrace("1  59.43.1.1  10 ms\n2  219.158.1.1  20 ms\n3  223.120.1.1  30 ms")
@@ -72,7 +81,27 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(self.classify(1299, 4809, 4809)[0], "CN2 GIA")
 
     def test_cn2_gt(self):
-        self.assertEqual(self.classify(1299, 4809, 4134)[0], "CN2 GT")
+        # 163 hands the traffic over on the China side, after the CN2 hops.
+        gt = qr.parse_nexttrace(trace_pairs(
+            (1299, "192.0.2.1"), (4809, "59.43.1.1"), (4809, "59.43.2.1"),
+            (4134, "202.97.1.1"), (4134, "202.96.1.1")))
+        self.assertEqual(qr.classify_route(gt)[0], "CN2 GT")
+
+    def test_cn2_gia_despite_china_telecom_hops_on_both_sides(self):
+        # A live 电信 trace: 218.30.* is China Telecom's international entry and
+        # 110.190.* the target province's access network, both announced under
+        # AS4134. No 202.97.* hop follows the CN2 run, so the line is GIA rather
+        # than GT.
+        hops = qr.parse_nexttrace(trace_pairs(
+            (25820, "45.78.1.1"), (4134, "218.30.1.1"),
+            (None, "59.43.1.1"), (None, "59.43.2.1"), (4134, "110.190.1.1")))
+        self.assertEqual(qr.classify_route(hops)[0], "CN2 GIA")
+
+    def test_cn2_hops_without_asn_still_split_by_address(self):
+        hops = qr.parse_nexttrace(trace_pairs(
+            (3356, "192.0.2.1"), (None, "59.43.1.1"), (4134, "202.97.1.1")))
+        self.assertEqual([hop.asn for hop in hops][1], 4809)
+        self.assertEqual(qr.classify_route(hops)[0], "CN2 GT")
 
     def test_ctg_gia(self):
         self.assertEqual(self.classify(1299, 23764, 4809)[0], "CTG GIA")
@@ -349,7 +378,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             data = json.loads(completed.stdout)
             self.assertEqual(data["schema_version"], "1.1")
-            self.assertEqual(data["tool_version"], "0.3.1")
+            self.assertEqual(data["tool_version"], "0.3.2")
             self.assertFalse(data["options"]["retry_partial"])
             self.assertFalse(data["options"]["asn_query"])
             self.assertEqual(data["tool_version"], qr.VERSION)
